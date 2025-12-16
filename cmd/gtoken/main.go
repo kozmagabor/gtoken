@@ -1,3 +1,4 @@
+//nolint:depguard // main.go imports third-party packages required for CLI functionality.
 package main
 
 import (

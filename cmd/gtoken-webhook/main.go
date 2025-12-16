@@ -1,13 +1,17 @@
+//nolint:depguard // main.go imports third-party packages required for webhook, metrics, and CLI functionality
 package main
 
 import (
 	"context"
+	"crypto/rand"
 	"fmt"
-	"math/rand"
+	"math/big"
 	"net/http"
 	"os"
+	"os/signal"
 	"runtime"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/pkg/errors"
@@ -30,34 +34,21 @@ import (
 
 /* #nosec */
 const (
-	// secretsInitContainer is the default gtoken container from which to pull the 'gtoken' binary.
 	gtokenInitImage = "doitintl/gtoken:latest"
-
-	// tokenVolumeName is the name of the volume where the generated id token will be stored
 	tokenVolumeName = "gtoken-volume"
-
-	// tokenVolumePath is the mount path where the generated id token will be stored
 	tokenVolumePath = "/var/run/secrets/aws/token"
+	tokenFileName   = "gtoken"
 
-	// token file name
-	tokenFileName = "gtoken"
-
-	// AWS annotation key; used to annotate Kubernetes Service Account with AWS Role ARN
-	awsRoleArnKey = "amazonaws.com/role-arn"
-
-	// AWS Web Identity Token ENV
+	awsRoleArnKey           = "amazonaws.com/role-arn"
 	awsWebIdentityTokenFile = "AWS_WEB_IDENTITY_TOKEN_FILE"
 	awsRoleArn              = "AWS_ROLE_ARN"
 	awsRoleSessionName      = "AWS_ROLE_SESSION_NAME"
 )
 
 var (
-	// Version contains the current version.
-	Version = "dev"
-	// BuildDate contains a string with the build date.
+	Version   = "dev"
 	BuildDate = "unknown"
-	// test mode
-	testMode = false
+	testMode  = false
 )
 
 const (
@@ -78,21 +69,22 @@ type mutatingWebhook struct {
 
 var logger *log.Logger
 
-// Returns an int >= min, < max
-func randomInt(min, max int) int {
-	//nolint:gosec
-	return min + rand.Intn(max-min)
-}
-
 // Generate a random string of a-z chars with len = l
 func randomString(l int) string {
 	if testMode {
-		return strings.Repeat("0", 16)
+		return strings.Repeat("0", l)
 	}
-	rand.Seed(time.Now().UnixNano())
+
 	bytes := make([]byte, l)
 	for i := 0; i < l; i++ {
-		bytes[i] = byte(randomInt(97, 122))
+		n, err := rand.Int(rand.Reader, big.NewInt(26))
+		if err != nil {
+			// log and fallback to 'a' character if random fails
+			logger.WithError(err).Error("failed to generate random string, fallback to 'a'")
+			bytes[i] = 'a'
+			continue
+		}
+		bytes[i] = byte(n.Int64() + 97)
 	}
 	return string(bytes)
 }
@@ -102,22 +94,43 @@ func newK8SClient() (kubernetes.Interface, error) {
 	if err != nil {
 		return nil, err
 	}
-
 	return kubernetes.NewForConfig(kubeConfig)
 }
 
 func healthzHandler(w http.ResponseWriter, r *http.Request) {
-	w.WriteHeader(200)
+	w.WriteHeader(http.StatusOK)
+	if _, err := w.Write([]byte("ok")); err != nil {
+		logger.WithError(err).Error("failed to write healthz response")
+	}
 }
 
-func serveMetrics(addr string) {
+func serveMetrics(ctx context.Context, addr string) {
 	logger.Infof("Telemetry on http://%s", addr)
 
 	mux := http.NewServeMux()
 	mux.Handle("/metrics", promhttp.Handler())
-	err := http.ListenAndServe(addr, mux)
-	if err != nil {
-		logger.WithError(err).Fatal("error serving telemetry")
+
+	srv := &http.Server{
+		Addr:         addr,
+		Handler:      mux,
+		ReadTimeout:  5 * time.Second,
+		WriteTimeout: 10 * time.Second,
+		IdleTimeout:  120 * time.Second,
+	}
+
+	go func() {
+		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			logger.WithError(err).Fatal("error serving telemetry")
+		}
+	}()
+
+	<-ctx.Done()
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := srv.Shutdown(shutdownCtx); err != nil {
+		logger.WithError(err).Error("error shutting down telemetry server")
+	} else {
+		logger.Info("Telemetry server stopped gracefully")
 	}
 }
 
@@ -134,93 +147,93 @@ func handlerFor(config mutating.WebhookConfig, recorder wh.MetricsRecorder, logg
 		Logger:  whlogrus.NewLogrus(log.NewEntry(logger)),
 	})
 	if err != nil {
-		logger.WithError(err).Fatalf("error creating webhook")
+		logger.WithError(err).Fatal("error creating webhook")
 	}
 
 	return handler
 }
 
 // check if K8s Service Account is annotated with AWS role
-func (mw *mutatingWebhook) getAwsRoleArn(ctx context.Context, name, ns string) (string, bool, error) {
+func (mw *mutatingWebhook) getAwsRoleArn(ctx context.Context, name, ns string) (roleArn string, ok bool, err error) {
 	sa, err := mw.k8sClient.CoreV1().ServiceAccounts(ns).Get(ctx, name, metav1.GetOptions{})
 	if err != nil {
-		logger.WithFields(log.Fields{"service account": name, "namespace": ns}).WithError(err).Fatalf("error getting service account")
+		// Log as error but don't terminate the webhook
+		logger.WithFields(log.Fields{
+			"service account": name,
+			"namespace":       ns,
+		}).WithError(err).Error("failed to get ServiceAccount")
 		return "", false, err
 	}
-	roleArn, ok := sa.GetAnnotations()[awsRoleArnKey]
-	return roleArn, ok, nil
+
+	roleArn, ok = sa.GetAnnotations()[awsRoleArnKey]
+	return
 }
 
 func (mw *mutatingWebhook) mutateContainers(containers []corev1.Container, roleArn string) bool {
 	if len(containers) == 0 {
 		return false
 	}
-	for i, container := range containers {
-		// add token volume mount
-		container.VolumeMounts = append(container.VolumeMounts, []corev1.VolumeMount{
-			{
-				Name:      mw.volumeName,
-				MountPath: mw.volumePath,
-			},
-		}...)
-		// add AWS Web Identity Token environment variables to container
-		container.Env = append(container.Env, []corev1.EnvVar{
-			{
+
+	for i := range containers {
+		container := &containers[i]
+
+		container.VolumeMounts = append(container.VolumeMounts, corev1.VolumeMount{
+			Name:      mw.volumeName,
+			MountPath: mw.volumePath,
+		})
+
+		container.Env = append(container.Env,
+			corev1.EnvVar{
 				Name:  awsWebIdentityTokenFile,
 				Value: fmt.Sprintf("%s/%s", mw.volumePath, mw.tokenFile),
 			},
-			{
+			corev1.EnvVar{
 				Name:  awsRoleArn,
 				Value: roleArn,
 			},
-			{
+			corev1.EnvVar{
 				Name:  awsRoleSessionName,
 				Value: fmt.Sprintf("gtoken-webhook-%s", randomString(16)),
 			},
-		}...)
-		// update containers
-		containers[i] = container
+		)
 	}
 	return true
 }
 
+// mutatePod mutates pod containers by adding gtoken init/sidekick containers and volumes.
+// Currently, it never returns an error. Kept error return for interface consistency.
+//nolint:unparam // always returns nil, kept for future error handling
 func (mw *mutatingWebhook) mutatePod(ctx context.Context, pod *corev1.Pod, ns string, dryRun bool) error {
-	// get service account AWS Role ARN annotation
 	roleArn, ok, err := mw.getAwsRoleArn(ctx, pod.Spec.ServiceAccountName, ns)
 	if err != nil {
-		return err
-	}
-	if !ok {
-		logger.Debug("skipping pods with Service Account without AWS Role ARN annotation")
+		// just log and skip mutation instead of terminating webhook
+		logger.WithFields(log.Fields{
+			"pod":             pod.Name,
+			"service account": pod.Spec.ServiceAccountName,
+			"namespace":       ns,
+		}).WithError(err).Warn("skipping pod mutation due to error fetching ServiceAccount")
 		return nil
 	}
-	// mutate Pod init containers
-	initContainersMutated := mw.mutateContainers(pod.Spec.InitContainers, roleArn)
-	if initContainersMutated {
-		logger.Debug("successfully mutated pod init containers")
-	} else {
-		logger.Debug("no pod init containers were mutated")
-	}
-	// mutate Pod containers
-	containersMutated := mw.mutateContainers(pod.Spec.Containers, roleArn)
-	if containersMutated {
-		logger.Debug("successfully mutated pod containers")
-	} else {
-		logger.Debug("no pod containers were mutated")
+
+	if !ok {
+		logger.WithFields(log.Fields{
+			"pod":             pod.Name,
+			"service account": pod.Spec.ServiceAccountName,
+		}).Debug("ServiceAccount has no AWS Role ARN annotation, skipping mutation")
+		return nil
 	}
 
-	if (initContainersMutated || containersMutated) && !dryRun {
-		// prepend gtoken init container (as first in it container)
+	initMutated := mw.mutateContainers(pod.Spec.InitContainers, roleArn)
+	contMutated := mw.mutateContainers(pod.Spec.Containers, roleArn)
+
+	if (initMutated || contMutated) && !dryRun {
 		pod.Spec.InitContainers = append([]corev1.Container{getGtokenContainer("generate-gcp-id-token",
 			mw.image, mw.pullPolicy, mw.volumeName, mw.volumePath, mw.tokenFile, false)}, pod.Spec.InitContainers...)
-		logger.Debug("successfully prepended pod init containers to spec")
-		// append sidekick gtoken update container (as last container)
+
 		pod.Spec.Containers = append(pod.Spec.Containers, getGtokenContainer("update-gcp-id-token",
 			mw.image, mw.pullPolicy, mw.volumeName, mw.volumePath, mw.tokenFile, true))
-		logger.Debug("successfully prepended pod sidekick containers to spec")
-		// append empty gtoken volume
+
 		pod.Spec.Volumes = append(pod.Spec.Volumes, getGtokenVolume(mw.volumeName))
-		logger.Debug("successfully appended pod spec volumes")
 	}
 
 	return nil
@@ -237,18 +250,14 @@ func getGtokenVolume(volumeName string) corev1.Volume {
 	}
 }
 
-func getGtokenContainer(name, image, pullPolicy, volumeName, volumePath, tokenFile string,
-	refresh bool) corev1.Container {
+func getGtokenContainer(name, image, pullPolicy, volumeName, volumePath, tokenFile string, refresh bool) corev1.Container {
 	return corev1.Container{
 		Name:            name,
 		Image:           image,
 		ImagePullPolicy: corev1.PullPolicy(pullPolicy),
 		Command:         []string{"/gtoken", fmt.Sprintf("--file=%s/%s", volumePath, tokenFile), fmt.Sprintf("--refresh=%t", refresh)},
 		VolumeMounts: []corev1.VolumeMount{
-			{
-				Name:      volumeName,
-				MountPath: volumePath,
-			},
+			{Name: volumeName, MountPath: volumePath},
 		},
 		Resources: corev1.ResourceRequirements{
 			Requests: corev1.ResourceList{
@@ -265,30 +274,28 @@ func getGtokenContainer(name, image, pullPolicy, volumeName, volumePath, tokenFi
 
 func init() {
 	logger = log.New()
-	// set log level
 	logger.SetLevel(log.WarnLevel)
 	logger.SetFormatter(&log.TextFormatter{})
 }
 
 func before(c *cli.Context) error {
-	// set debug log level
-	switch level := c.GlobalString("log-level"); level {
-	case "debug", "DEBUG":
+	switch level := strings.ToLower(c.GlobalString("log-level")); level {
+	case "debug":
 		logger.SetLevel(log.DebugLevel)
-	case "info", "INFO":
+	case "info":
 		logger.SetLevel(log.InfoLevel)
-	case "warning", "WARNING":
+	case "warning":
 		logger.SetLevel(log.WarnLevel)
-	case "error", "ERROR":
+	case "error":
 		logger.SetLevel(log.ErrorLevel)
-	case "fatal", "FATAL":
+	case "fatal":
 		logger.SetLevel(log.FatalLevel)
-	case "panic", "PANIC":
+	case "panic":
 		logger.SetLevel(log.PanicLevel)
 	default:
 		logger.SetLevel(log.WarnLevel)
 	}
-	// set log formatter to JSON
+
 	if c.GlobalBool("json") {
 		logger.SetFormatter(&log.JSONFormatter{})
 	}
@@ -308,11 +315,10 @@ func (mw *mutatingWebhook) podMutator(ctx context.Context, ar *whmodel.Admission
 	}
 }
 
-// mutation webhook server
-func runWebhook(c *cli.Context) error {
+func runWebhookWithContext(ctx context.Context, c *cli.Context) error {
 	k8sClient, err := newK8SClient()
 	if err != nil {
-		logger.WithError(err).Fatal("error creating k8s client")
+		return err
 	}
 
 	webhook := mutatingWebhook{
@@ -329,7 +335,7 @@ func runWebhook(c *cli.Context) error {
 		Registry: prometheus.DefaultRegisterer,
 	})
 	if err != nil {
-		logger.WithError(err).Fatalf("error creating metrics recorder")
+		return err
 	}
 
 	podHandler := handlerFor(
@@ -352,23 +358,46 @@ func runWebhook(c *cli.Context) error {
 	tlsCertFile := c.String("tls-cert-file")
 	tlsPrivateKeyFile := c.String("tls-private-key-file")
 
-	if len(telemetryAddress) > 0 {
-		// Serving metrics without TLS on separated address
-		go serveMetrics(telemetryAddress)
+	if telemetryAddress != "" {
+		go serveMetrics(ctx, telemetryAddress)
 	} else {
 		mux.Handle("/metrics", promhttp.Handler())
 	}
 
-	if tlsCertFile == "" && tlsPrivateKeyFile == "" {
-		logger.Infof("listening on http://%s", listenAddress)
-		err = http.ListenAndServe(listenAddress, mux)
-	} else {
-		logger.Infof("listening on https://%s", listenAddress)
-		err = http.ListenAndServeTLS(listenAddress, tlsCertFile, tlsPrivateKeyFile, mux)
+	srv := &http.Server{
+		Addr:         listenAddress,
+		Handler:      mux,
+		ReadTimeout:  5 * time.Second,
+		WriteTimeout: 10 * time.Second,
+		IdleTimeout:  120 * time.Second,
 	}
 
-	if err != nil {
-		logger.WithError(err).Fatal("error serving webhook")
+	serverErrCh := make(chan error, 1)
+	go func() {
+		if tlsCertFile == "" && tlsPrivateKeyFile == "" {
+			logger.Infof("listening on http://%s", listenAddress)
+			serverErrCh <- srv.ListenAndServe()
+		} else {
+			logger.Infof("listening on https://%s", listenAddress)
+			serverErrCh <- srv.ListenAndServeTLS(tlsCertFile, tlsPrivateKeyFile)
+		}
+	}()
+
+	select {
+	case <-ctx.Done():
+		logger.Info("termination signal received, shutting down servers...")
+	case err := <-serverErrCh:
+		if err != nil && err != http.ErrServerClosed {
+			logger.WithError(err).Fatal("server failed")
+		}
+	}
+
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := srv.Shutdown(shutdownCtx); err != nil {
+		logger.WithError(err).Error("error shutting down webhook server")
+	} else {
+		logger.Info("Webhook server stopped gracefully")
 	}
 
 	return nil
@@ -380,86 +409,41 @@ func main() {
 		fmt.Printf("  build date: %s\n", BuildDate)
 		fmt.Printf("  built with: %s\n", runtime.Version())
 	}
+
 	app := cli.NewApp()
 	app.Name = "gtoken-webhook"
 	app.Version = Version
-	app.Authors = []cli.Author{
-		{
-			Name:  "Alexei Ledenev",
-			Email: "alexei.led@gmail.com",
-		},
-	}
-	app.Usage = "gtoken-webhook is a Kubernetes mutation controller providing a secure access to AWS services from GKE pods"
+	app.Authors = []cli.Author{{Name: "Alexei Ledenev", Email: "alexei.led@gmail.com"}}
+	app.Usage = "gtoken-webhook is a Kubernetes mutation controller providing secure AWS access from GKE pods"
 	app.Before = before
 	app.Flags = []cli.Flag{
-		cli.StringFlag{
-			Name:   "log-level",
-			Usage:  "set log level (debug, info, warning(*), error, fatal, panic)",
-			Value:  "warning",
-			EnvVar: "LOG_LEVEL",
-		},
-		cli.BoolFlag{
-			Name:   "json",
-			Usage:  "produce log in JSON format: Logstash and Splunk friendly",
-			EnvVar: "LOG_JSON",
-		},
+		cli.StringFlag{Name: "log-level", Usage: "set log level (debug, info, warning, error, fatal, panic)", Value: "warning", EnvVar: "LOG_LEVEL"},
+		cli.BoolFlag{Name: "json", Usage: "produce log in JSON format", EnvVar: "LOG_JSON"},
 	}
 	app.Commands = []cli.Command{
 		{
 			Name: "server",
 			Flags: []cli.Flag{
-				cli.StringFlag{
-					Name:  "listen-address",
-					Usage: "webhook server listen address",
-					Value: ":8443",
-				},
-				cli.StringFlag{
-					Name:  "telemetry-listen-address",
-					Usage: "specify a dedicated prometheus metrics listen address (using listen-address, if empty)",
-				},
-				cli.StringFlag{
-					Name:  "tls-cert-file",
-					Usage: "TLS certificate file",
-				},
-				cli.StringFlag{
-					Name:  "tls-private-key-file",
-					Usage: "TLS private key file",
-				},
-				cli.StringFlag{
-					Name:  "image",
-					Usage: "Docker image with secrets-init utility on board",
-					Value: gtokenInitImage,
-				},
-				cli.StringFlag{
-					Name:  "pull-policy",
-					Usage: "Docker image pull policy",
-					Value: string(corev1.PullIfNotPresent),
-				},
-				cli.StringFlag{
-					Name:  "volume-name",
-					Usage: "mount volume name",
-					Value: tokenVolumeName,
-				},
-				cli.StringFlag{
-					Name:  "volume-path",
-					Usage: "mount volume path",
-					Value: tokenVolumePath,
-				},
-				cli.StringFlag{
-					Name:  "token-file",
-					Usage: "token file name",
-					Value: tokenFileName,
-				},
+				cli.StringFlag{Name: "listen-address", Usage: "webhook server listen address", Value: ":8443"},
+				cli.StringFlag{Name: "telemetry-listen-address", Usage: "dedicated Prometheus metrics listen address"},
+				cli.StringFlag{Name: "tls-cert-file", Usage: "TLS certificate file"},
+				cli.StringFlag{Name: "tls-private-key-file", Usage: "TLS private key file"},
+				cli.StringFlag{Name: "image", Usage: "Docker image with secrets-init utility on board", Value: gtokenInitImage},
+				cli.StringFlag{Name: "pull-policy", Usage: "Docker image pull policy", Value: string(corev1.PullIfNotPresent)},
+				cli.StringFlag{Name: "volume-name", Usage: "mount volume name", Value: tokenVolumeName},
+				cli.StringFlag{Name: "volume-path", Usage: "mount volume path", Value: tokenVolumePath},
+				cli.StringFlag{Name: "token-file", Usage: "token file name", Value: tokenFileName},
 			},
-			Usage:       "mutation admission webhook",
-			Description: "run mutation admission webhook server",
-			Action:      runWebhook,
+			Action: func(c *cli.Context) error {
+				ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+				defer stop()
+				return runWebhookWithContext(ctx, c)
+			},
 		},
 	}
-	// print version in debug mode
+
 	logger.WithField("version", app.Version).Debug("running gtoken-webhook")
 
-	// run main command
 	if err := app.Run(os.Args); err != nil {
 		logger.Fatal(err)
 	}

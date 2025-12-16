@@ -1,64 +1,11 @@
+version: "2"
 run:
-  # which dirs to skip
-  skip-dirs:
-    - mocks
-  # Timeout for analysis, e.g. 30s, 5m.
-  # Default: 1m
-  timeout: 5m
-  # Exit code when at least one issue was found.
-  # Default: 1
   issues-exit-code: 2
-  # Include test files or not.
-  # Default: true
   tests: false
-
-linters-settings:
-  govet:
-    check-shadowing: true
-  golint:
-    min-confidence: 0
-  gocyclo:
-    min-complexity: 15
-  maligned:
-    suggest-new: true
-  dupl:
-    threshold: 100
-  goconst:
-    min-len: 2
-    min-occurrences: 2
-  misspell:
-    locale: US
-  lll:
-    line-length: 140
-  goimports:
-    local-prefixes: github.com/golangci/golangci-lint
-  gocritic:
-    enabled-tags:
-      - diagnostic
-      - experimental
-      - opinionated
-      - performance
-      - style
-    disabled-checks:
-      - dupImport # https://github.com/go-critic/go-critic/issues/845
-      - ifElseChain
-      - octalLiteral
-      - rangeValCopy
-      - unnamedResult
-      - whyNoLint
-      - wrapperFunc
-  funlen:
-    lines: 100
-    statements: 50
-
 linters:
-  # please, do not use `enable-all`: it's deprecated and will be removed soon.
-  # inverted configuration with `enable-all` and `disable` is not scalable during updates of golangci-lint
-  disable-all: true
+  default: none
   enable:
-    # - rowserrcheck
     - bodyclose
-    - deadcode
     - depguard
     - dogsled
     - dupl
@@ -67,35 +14,72 @@ linters:
     - goconst
     - gocritic
     - gocyclo
-    - gofmt
-    - goimports
-    - golint
     - gosec
-    - gosimple
     - govet
     - ineffassign
-    - interfacer
     - lll
     - misspell
     - nakedret
-    - scopelint
     - staticcheck
-    - structcheck
-    - stylecheck
-    - typecheck
     - unconvert
     - unparam
     - unused
-    - varcheck
     - whitespace
-
-  # don't enable:
-  # - gochecknoglobals
-  # - gocognit
-  # - godox
-  # - maligned
-  # - prealloc
-
-issues:
-    exclude:
-        - Using the variable on range scope `tt` in function literal
+  settings:
+    dupl:
+      threshold: 100
+    funlen:
+      lines: 100
+      statements: 50
+    goconst:
+      min-len: 2
+      min-occurrences: 2
+    gocritic:
+      disabled-checks:
+        - dupImport
+        - ifElseChain
+        - octalLiteral
+        - rangeValCopy
+        - unnamedResult
+        - whyNoLint
+        - wrapperFunc
+      enabled-tags:
+        - diagnostic
+        - experimental
+        - opinionated
+        - performance
+        - style
+    gocyclo:
+      min-complexity: 15
+    lll:
+      line-length: 140
+    misspell:
+      locale: US
+  exclusions:
+    generated: lax
+    presets:
+      - comments
+      - common-false-positives
+      - legacy
+      - std-error-handling
+    rules:
+      - path: (.+)\.go$
+        text: Using the variable on range scope `tt` in function literal
+    paths:
+      - third_party$
+      - builtin$
+      - examples$
+formatters:
+  enable:
+    - gofmt
+    - goimports
+  settings:
+    goimports:
+      local-prefixes:
+        - github.com/golangci/golangci-lint
+  exclusions:
+    generated: lax
+    paths:
+      - third_party$
+      - builtin$
+      - examples$

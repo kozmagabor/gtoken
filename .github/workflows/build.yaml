@@ -3,77 +3,60 @@ name: Docker Image CI
 on:
   push:
     branches:
-      - '*'
+      - "*"
     tags:
-      - '*'
+      - "*"
 
 jobs:
-
   build:
-
     runs-on: ubuntu-latest
     if: "!contains(github.event.head_commit.message, '[skip ci]')"
- 
+
     steps:
-    - name: Checkout code
-      uses: actions/checkout@v2
+      - name: Checkout code
+        uses: actions/checkout@v2
 
-    - name: Decide on tag
-      id: tagger
-      run: |
-        tag=$(echo "${{ github.ref }}" | sed -e 's/^refs\/heads\///g' -e 's/^refs\/tags\///g' -e 's/^refs\/pull\///g' -e 's/\/merge$//g' | sed -e 's/master/latest/g')
-        echo "::set-output name=tag::${tag}"
-        echo "::debug::docker image tag ${tag}"
+      - name: Decide on tag
+        id: tagger
+        run: |
+          tag=$(echo "${{ github.ref }}" | sed -e 's/^refs\/heads\///g' -e 's/^refs\/tags\///g' -e 's/^refs\/pull\///g' -e 's/\/merge$//g' | sed -e 's/master/latest/g')
+          echo "::set-output name=tag::${tag}"
+          echo "::debug::docker image tag ${tag}"
 
-    - name: Login to DockerHub
-      uses: docker/login-action@v1
-      with:
-        username: ${{ secrets.DOCKER_ACCOUNT }}
-        password: ${{ secrets.DOCKER_TOKEN }}
+      - name: Login to DockerHub
+        uses: docker/login-action@v1
+        with:
+          username: ${{ secrets.DOCKER_ACCOUNT }}
+          password: ${{ secrets.DOCKER_TOKEN }}
 
-    - name: Set up QEMU
-      uses: docker/setup-qemu-action@v1
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v1
 
-    - name: Set up Docker buildx
-      id: buildx
-      uses: docker/setup-buildx-action@v1
+      - name: Set up Docker buildx
+        id: buildx
+        uses: docker/setup-buildx-action@v1
 
-    - name: Cache Docker layers
-      uses: actions/cache@v2
-      id: cache
-      with:
-        path: /tmp/.buildx-cache
-        key: ${{ runner.os }}-buildx-${{ github.sha }}
-        restore-keys: |
-            ${{ runner.os }}-buildx-
+      - name: Build and push gtoken Docker image
+        if: github.event_name != 'pull_request'
+        uses: docker/build-push-action@v2
+        with:
+          context: cmd/gtoken
+          push: true
+          tags: ${{ secrets.DOCKER_REPOSITORY }}/gtoken:${{ steps.tagger.outputs.tag }}
 
-    - name: Build and push gtoken Docker image
-      if: github.event_name != 'pull_request'
-      uses: docker/build-push-action@v2
-      with:
-        context: cmd/gtoken
-        cache-from: type=local,src=/tmp/.buildx-cache
-        cache-to: type=local,dest=/tmp/.buildx-cache
-        push: true
-        tags: ${{ secrets.DOCKER_REPOSITORY }}/gtoken:${{ steps.tagger.outputs.tag }}
+      - name: Build and push gtoken:alpine Docker image
+        if: github.event_name != 'pull_request'
+        uses: docker/build-push-action@v2
+        with:
+          context: cmd/gtoken
+          target: certs
+          push: true
+          tags: ${{ secrets.DOCKER_REPOSITORY }}/gtoken:${{ steps.tagger.outputs.tag }}-alpine
 
-    - name: Build and push gtoken:alpine Docker image
-      if: github.event_name != 'pull_request'
-      uses: docker/build-push-action@v2
-      with:
-        context: cmd/gtoken
-        target: certs
-        cache-from: type=local,src=/tmp/.buildx-cache
-        cache-to: type=local,dest=/tmp/.buildx-cache
-        push: true
-        tags: ${{ secrets.DOCKER_REPOSITORY }}/gtoken:${{ steps.tagger.outputs.tag }}-alpine
-
-    - name: Build and push gtoken-webhook Docker image
-      if: github.event_name != 'pull_request'
-      uses: docker/build-push-action@v2
-      with:
-        context: cmd/gtoken-webhook
-        cache-from: type=local,src=/tmp/.buildx-cache
-        cache-to: type=local,dest=/tmp/.buildx-cache
-        push: true
-        tags: ${{ secrets.DOCKER_REPOSITORY }}/gtoken-webhook:${{ steps.tagger.outputs.tag }}
+      - name: Build and push gtoken-webhook Docker image
+        if: github.event_name != 'pull_request'
+        uses: docker/build-push-action@v2
+        with:
+          context: cmd/gtoken-webhook
+          push: true
+          tags: ${{ secrets.DOCKER_REPOSITORY }}/gtoken-webhook:${{ steps.tagger.outputs.tag }}
